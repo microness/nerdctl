@@ -24,57 +24,92 @@ import (
 	"github.com/coreos/go-iptables/iptables"
 	"gotest.tools/v3/assert"
 
+	"github.com/containerd/nerdctl/mod/tigron/test"
 	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 	"github.com/containerd/nerdctl/v2/pkg/testutil"
 	iptablesutil "github.com/containerd/nerdctl/v2/pkg/testutil/iptables"
 	"github.com/containerd/nerdctl/v2/pkg/testutil/nerdtest"
 )
 
-// TestKillCleanupForwards runs a container that exposes a port and then kill it.
-// The test checks that the kill command effectively clean up
-// the iptables forwards creted from the run.
+// TestKillCleanupForwards verifies that iptables port forwarding
+// rules created by `nerdctl run -p` are removed after `nerdctl kill`.
 func TestKillCleanupForwards(t *testing.T) {
-	const (
-		hostPort          = 9999
-		testContainerName = "ngx"
-	)
-	base := testutil.NewBase(t)
-	defer func() {
-		base.Cmd("rm", "-f", testContainerName).Run()
-	}()
-
-	// skip if rootless
 	if rootlessutil.IsRootless() {
-		t.Skip("pkg/testutil/iptables does not support rootless")
+		t.Skip("iptables hostport rules are not supported in rootless mode")
 	}
+
+	const hostPort = 9999
+
+	testCase := nerdtest.Setup()
 
 	ipt, err := iptables.New()
 	assert.NilError(t, err)
 
-	containerID := base.Cmd("run", "-d",
-		"--restart=no",
-		"--name", testContainerName,
-		"-p", fmt.Sprintf("127.0.0.1:%d:80", hostPort),
-		testutil.NginxAlpineImage).Run().Stdout()
-	containerID = strings.TrimSuffix(containerID, "\n")
-
-	containerIP := base.Cmd("inspect",
-		"-f",
-		"'{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}'",
-		testContainerName).Run().Stdout()
-	containerIP = strings.ReplaceAll(containerIP, "'", "")
-	containerIP = strings.TrimSuffix(containerIP, "\n")
-
-	// define iptables chain name depending on the target (docker/nerdctl)
-	var chain string
-	if nerdtest.IsDocker() {
-		chain = "DOCKER"
-	} else {
-		redirectChain := "CNI-HOSTPORT-DNAT"
-		chain = iptablesutil.GetRedirectedChain(t, ipt, redirectChain, testutil.Namespace, containerID)
+	// --------------------
+	// Setup: run container
+	// --------------------
+	testCase.Setup = func(data test.Data, helpers test.Helpers) {
+		helpers.Ensure(
+			"run", "-d",
+			"--restart=no",
+			"--name", data.Identifier(),
+			"-p", fmt.Sprintf("127.0.0.1:%d:80", hostPort),
+			testutil.NginxAlpineImage,
+		)
 	}
-	assert.Equal(t, iptablesutil.ForwardExists(t, ipt, chain, containerIP, hostPort), true)
 
-	base.Cmd("kill", testContainerName).AssertOK()
-	assert.Equal(t, iptablesutil.ForwardExists(t, ipt, chain, containerIP, hostPort), false)
+	// --------------------
+	// Cleanup: remove container
+	// --------------------
+	testCase.Cleanup = func(data test.Data, helpers test.Helpers) {
+		helpers.Anyhow("rm", "-f", data.Identifier())
+	}
+
+	// --------------------
+	// Command: kill container
+	// --------------------
+	testCase.Command = func(data test.Data, helpers test.Helpers) test.TestableCommand {
+		name := data.Identifier()
+
+		// inspect: kill 결과 검증을 위한 좌표 수집
+		containerID := strings.TrimSpace(
+			helpers.Capture("inspect", "-f", "{{.Id}}", name),
+		)
+
+		containerIP := strings.TrimSpace(
+			helpers.Capture(
+				"inspect",
+				"-f", "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+				name,
+			),
+		)
+
+		// chain 결정
+		var chain string
+		if nerdtest.IsDocker() {
+			chain = "DOCKER"
+		} else {
+			chain = iptablesutil.GetRedirectedChain(
+				t,
+				ipt,
+				"CNI-HOSTPORT-DNAT",
+				testutil.Namespace,
+				containerID,
+			)
+		}
+
+		// kill 전 전제 조건 검증
+		assert.Assert(
+			helpers.T(),
+			iptablesutil.ForwardExists(t, ipt, chain, containerIP, hostPort),
+			"expected iptables forward to exist before kill",
+		)
+
+		// 검증 대상 행위
+		return helpers.Command("kill", name)
+	}
+
+	testCase.Run(t)
+
+	testCase.Expected = test.Expects(0, nil, nil)
 }
