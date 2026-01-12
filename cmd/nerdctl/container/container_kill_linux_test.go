@@ -109,7 +109,7 @@ func TestKillCleanupForwards(t *testing.T) {
 		return helpers.Command("kill", name)
 	}
 
-	testCase.Run(t)
-
 	testCase.Expected = test.Expects(0, nil, nil)
+	
+	testCase.Run(t)
 }
